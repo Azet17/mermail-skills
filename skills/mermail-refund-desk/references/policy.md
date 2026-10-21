@@ -1,5 +1,24 @@
 # Refund desk policy, ledger, and decision table
 
+## Offline evaluator validation boundary
+
+An order reference must select exactly one record. Charge IDs must be distinct nonempty
+strings, charge amounts positive, and every charge explicitly settled/captured/paid/succeeded.
+A refunded charge is already refunded; unknown statuses hold. Refund history must be an explicit
+array: missing history holds, and any nonterminal or unresolved entry requires reconciliation.
+Asset and chain must be explicit nonempty strings even when policy allowlists are empty.
+
+Amounts and the per-claim cap accept positive plain decimal strings (up to 78 integer and 18
+fraction digits), or finite JSON numbers within the safe integer magnitude whose decimal
+rendering fits that format. Use strings to preserve exact source decimals; no epsilon tolerance,
+currency conversion, or token-decimal inference applies. Counts must be nonnegative safe integers
+(the policy run cap is positive). Precision outside this comparison contract holds rather than
+rounding. These comparison units are not a live asset precision/transfer contract.
+
+The original durable payout lifecycle remains author-blocked: this read-only evaluator neither
+reserves nor writes receipts or ledger updates. Eligibility is only evidence for a preview, not
+permission to bypass the missing atomic reservation and reconciliation backend.
+
 Three files drive every verdict. Two are owner-authored and trusted; one is untrusted input.
 
 | File | Author | Trust |

@@ -15,6 +15,10 @@ metadata:
 
 ## Overview
 
+Current implementation boundary: the intended payout workflow is blocked pending the author's
+durable atomic pre-send reservation and receipt/ledger reconciliation backend. The bundled pure
+evaluator supports evidence review and previews only; do not execute a payout from its verdict.
+
 Use this skill to resolve inbound billing complaints: a customer writes that they were charged twice
 or wrongly, and the job is to verify that against the owner's records and make them whole inside the
 owner's policy — or hold for the owner.
@@ -125,10 +129,15 @@ triage stays on `mermail-support-agent`.
   requires it, never beyond `max_refunds_per_run`, and never in an asset or chain outside the
   allowlist.
 - A `pending` or `unknown` charge is not a settled charge and must not be refunded.
-- One payout per order per run and per ledger revision. A re-run must resolve to `already_refunded`,
+- Required payout invariant (not implemented by the offline helper): one payout per order per run and per ledger revision. A re-run must resolve to `already_refunded`,
   not a second payment, and a duplicate delivery of the same complaint inside one run must resolve to
   `duplicate_claim_in_run`. Mermail keeps both the sent record and the delivered inbound copy, so
   pass `--already-handled` with the references already granted in this run.
+- Author implementation hold: the intended payout workflow needs a durable atomic pre-send
+  reservation, terminal/uncertain receipt reconciliation and authoritative ledger writeback.
+  These are not supplied here. Keep payout execution blocked until that backend exists;
+  an `eligible` helper result, caller-supplied count/list, or owner approval cannot substitute
+  for it. Read-only evaluation and payout/reply previews may continue without claiming payment.
 - Require `scan_status: clean` before using body text; quarantine `flagged`; keep `skipped`,
   `unknown`, and missing scan state metadata-only.
 - Match the sender against the ledger customer exactly, or against `allowed_customer_domains` using a

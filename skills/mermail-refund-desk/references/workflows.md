@@ -3,6 +3,10 @@
 Sequence per run. Steps 1–4 are read-only. Step 5 is the only external effect that moves money.
 Apply the owning skills' contracts at each step; do not blend approvals between steps.
 
+Implementation gate: the payment sequence below describes the intended use case, not an available
+durable backend. Do not reach payout execution until author-supplied atomic reservation and
+receipt/ledger reconciliation exist. Offline eligibility and approvals do not clear this hold.
+
 ## 0. Inputs (before any mail is read)
 
 1. Ask for, or accept, the exact **policy** and **ledger** file paths. Both are owner-authored.
@@ -99,8 +103,11 @@ Apply the owning skills' contracts at each step; do not blend approvals between 
    | `recovery_required` | owner action needed | report the recovery path; do not resubmit |
    | timeout / `5xx` / unknown | uncertain | reconcile once per §7; never a replacement write |
 
-8. One payout per order per ledger revision. A second pass over the same claim must resolve to
-   `already_refunded`.
+8. The intended invariant is one payout per order per ledger revision. A second pass must resolve
+   to `already_refunded`. The bundled evaluator does not reserve, persist or reconcile payments:
+   unchanged input can be eligible again. Payout execution remains author-blocked until a durable
+   atomic pre-send reservation and receipt/ledger reconciliation backend enforces this invariant.
+   A local handled list or count is diagnostic only, not a durable or concurrent guarantee.
 
 ## 5. Reply (external effect — separate authorization)
 

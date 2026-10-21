@@ -79,13 +79,21 @@ function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function nearlyEqual(a, b) {
-  if (!isFiniteNumber(a) || !isFiniteNumber(b)) return false;
-  return Math.abs(a - b) <= 1e-9;
+// Comparison units only, not an assertion about a live token's decimals. Use
+// explicit decimal strings when JSON numbers cannot preserve the source value.
+function decimalUnits(value) {
+  if (isFiniteNumber(value)) {
+    if (Math.abs(value) > Number.MAX_SAFE_INTEGER) return null;
+    value = String(value);
+  }
+  if (typeof value !== "string" || !/^-?(?:0|[1-9]\d{0,77})(?:\.\d{1,18})?$/.test(value)) return null;
+  const negative = value.startsWith("-");
+  const [whole, fraction = ""] = (negative ? value.slice(1) : value).split(".");
+  const units = BigInt(whole + fraction.padEnd(18, "0"));
+  return negative ? -units : units;
 }
 
-const SETTLED = new Set(["settled", "captured", "paid", "succeeded", "refunded"]);
-const UNSETTLED = new Set(["pending", "unknown", "processing", "authorized", "disputed"]);
+const SETTLED = new Set(["settled", "captured", "paid", "succeeded"]);
 const REFUND_DONE = new Set(["refunded", "settled", "paid", "succeeded"]);
 
 function decision(disposition, reason_code, extra = {}) {
@@ -103,7 +111,11 @@ function decision(disposition, reason_code, extra = {}) {
  * @param {{paidThisRun?: number}} run
  */
 export function evaluateClaim(claim, ledger, policy, run = {}) {
-  const paidThisRun = isFiniteNumber(run.paidThisRun) ? run.paidThisRun : 0;
+  if (!run || typeof run !== "object" || Array.isArray(run) ||
+      (run.alreadyHandled !== undefined && !Array.isArray(run.alreadyHandled))) {
+    return decision("rejected", "invalid_input", { detail: "run state must contain a valid handled-reference list when provided" });
+  }
+  const paidThisRun = run?.paidThisRun === undefined ? 0 : run.paidThisRun;
 
   // ---- 1. structural validation -------------------------------------------------
   if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
@@ -112,17 +124,19 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
   if (!ledger || typeof ledger !== "object" || !Array.isArray(ledger.orders)) {
     return decision("rejected", "invalid_input", { detail: "ledger.orders must be an array" });
   }
-  if (!policy || typeof policy !== "object") {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
     return decision("rejected", "invalid_input", { detail: "policy must be an object" });
   }
   if (
-    !isFiniteNumber(policy.max_refund_per_claim) ||
-    !isFiniteNumber(policy.max_refunds_per_run) ||
-    policy.max_refund_per_claim <= 0 ||
-    policy.max_refunds_per_run <= 0
+    decimalUnits(policy.max_refund_per_claim) === null ||
+    decimalUnits(policy.max_refund_per_claim) <= 0n ||
+    !Number.isSafeInteger(policy.max_refunds_per_run) || policy.max_refunds_per_run <= 0 ||
+    !Number.isSafeInteger(paidThisRun) || paidThisRun < 0 ||
+    ["allowed_assets", "allowed_chains", "allowed_customer_domains"].some((key) =>
+      policy[key] !== undefined && (!Array.isArray(policy[key]) || policy[key].some((v) => typeof v !== "string" || !v.trim())))
   ) {
     return decision("rejected", "invalid_input", {
-      detail: "policy.max_refund_per_claim and policy.max_refunds_per_run must be positive numbers",
+      detail: "policy caps, allowlists and nonnegative integer run count must be valid",
     });
   }
   if (typeof policy.currency_unit !== "string" || !policy.currency_unit.trim()) {
@@ -147,7 +161,13 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
     });
   }
 
-  const order = ledger.orders.find((candidate) => String(candidate?.order_ref ?? "").trim() === orderRef);
+  const matchingOrders = ledger.orders.filter((candidate) =>
+    candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+    ["string", "number"].includes(typeof candidate.order_ref) && String(candidate.order_ref).trim() === orderRef);
+  if (matchingOrders.length > 1) {
+    return decision("needs_human", "ambiguous_order_reference", { ...base, order_ref: orderRef, next_action: "ask_owner" });
+  }
+  const order = matchingOrders[0];
   if (!order) {
     return decision("needs_human", "order_not_in_ledger", {
       ...base,
@@ -160,6 +180,9 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
   const sender = normalizeEmail(claim.from_email);
   const ledgerCustomer = normalizeEmail(order.customer_email);
   const flags = [];
+  if (!isValidEmail(order.customer_email)) {
+    return decision("needs_human", "invalid_ledger_customer", { ...base, order_ref: orderRef, next_action: "ask_owner" });
+  }
 
   // ---- 3. identity: the sender must BE the ledger's customer --------------------
   if (!isValidEmail(claim.from_email)) {
@@ -184,7 +207,13 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
   if (!senderMatchesCustomer && senderOnAllowedDomain) flags.push("identity_via_allowed_domain");
 
   // ---- 4. idempotency: has this order already been made whole? ------------------
-  const priorRefunds = Array.isArray(order.prior_refunds) ? order.prior_refunds : [];
+  if (!Array.isArray(order.charges) || order.charges.length === 0) {
+    return decision("needs_human", "order_not_in_ledger", { ...base, order_ref: orderRef, next_action: "ask_owner" });
+  }
+  if (!Array.isArray(order.prior_refunds)) {
+    return decision("needs_human", "refund_history_unavailable", { ...base, order_ref: orderRef, next_action: "ask_owner" });
+  }
+  const priorRefunds = order.prior_refunds;
   if (priorRefunds.some((refund) => REFUND_DONE.has(String(refund?.status ?? "").toLowerCase()))) {
     return decision("rejected", "already_refunded", {
       ...base,
@@ -192,6 +221,11 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
       customer_email: order.customer_email ?? null,
       flags: ["prior_refund_recorded"],
       next_action: "none",
+    });
+  }
+  if (priorRefunds.length > 0) {
+    return decision("needs_human", "prior_refund_requires_reconciliation", {
+      ...base, order_ref: orderRef, flags: ["nonterminal_or_unresolved_refund_history"], next_action: "ask_owner",
     });
   }
 
@@ -205,7 +239,17 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
       next_action: "ask_owner",
     });
   }
-  const unsettled = charges.filter((charge) => UNSETTLED.has(String(charge?.status ?? "").toLowerCase()));
+  const ids = charges.map((charge) => typeof charge?.charge_id === "string" ? charge.charge_id.trim() : "");
+  if (ids.some((id) => !id) || new Set(ids).size !== ids.length ||
+      charges.some((charge) => decimalUnits(charge?.amount) === null || decimalUnits(charge.amount) <= 0n)) {
+    return decision("needs_human", "invalid_charge_evidence", {
+      ...base, order_ref: orderRef, flags: ["charge_identity_or_positive_exact_amount_invalid"], next_action: "ask_owner",
+    });
+  }
+  if (charges.some((charge) => String(charge.status ?? "").toLowerCase() === "refunded")) {
+    return decision("rejected", "already_refunded", { ...base, order_ref: orderRef, flags: ["charge_marked_refunded"], next_action: "none" });
+  }
+  const unsettled = charges.filter((charge) => !SETTLED.has(String(charge?.status ?? "").toLowerCase()));
   if (unsettled.length > 0) {
     return decision("needs_human", "unsettled_charge_present", {
       ...base,
@@ -245,7 +289,7 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
     });
   }
   const [first, second] = settled;
-  if (!isFiniteNumber(first?.amount) || !isFiniteNumber(second?.amount) || !nearlyEqual(first.amount, second.amount)) {
+  if (decimalUnits(first.amount) !== decimalUnits(second.amount)) {
     return decision("needs_human", "manual_review_amount_mismatch", {
       ...base,
       order_ref: orderRef,
@@ -278,9 +322,15 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
       ...base, order_ref: orderRef, verified, flags: ["ledger_payout_has_no_destination"], next_action: "ask_owner",
     });
   }
-  if (!isFiniteNumber(payout.amount) || payout.amount <= 0) {
+  if (decimalUnits(payout.amount) === null || decimalUnits(payout.amount) <= 0n) {
     return decision("needs_human", "no_authorized_destination", {
       ...base, order_ref: orderRef, verified, flags: ["ledger_payout_has_no_positive_amount"], next_action: "ask_owner",
+    });
+  }
+  if (typeof payout.asset !== "string" || !payout.asset.trim() ||
+      typeof payout.chain !== "string" || !payout.chain.trim()) {
+    return decision("needs_human", "asset_or_chain_not_allowed", {
+      ...base, order_ref: orderRef, verified, flags: ["ledger_asset_or_chain_missing"], next_action: "ask_owner",
     });
   }
 
@@ -301,7 +351,8 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
       });
     }
   }
-  if (isFiniteNumber(claim.claimed_amount) && !nearlyEqual(claim.claimed_amount, duplicateAmount)) {
+  if (claim.claimed_amount !== undefined && claim.claimed_amount !== null &&
+      decimalUnits(claim.claimed_amount) !== decimalUnits(duplicateAmount)) {
     flags.push(`claimed_amount=${claim.claimed_amount}`);
     if (policy.hold_on_claim_amount_mismatch === true) {
       return decision("needs_human", "claim_amount_mismatch", {
@@ -329,7 +380,7 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
   }
 
   // ---- 10. policy caps and allowlists -------------------------------------------
-  if (payout.amount > policy.max_refund_per_claim) {
+  if (decimalUnits(payout.amount) > decimalUnits(policy.max_refund_per_claim)) {
     return decision("needs_human", "over_policy_cap", {
       ...base,
       order_ref: orderRef,
@@ -339,7 +390,7 @@ export function evaluateClaim(claim, ledger, policy, run = {}) {
       next_action: "ask_owner",
     });
   }
-  if (policy.require_amount_not_above_duplicate !== false && payout.amount > duplicateAmount + 1e-9) {
+  if (policy.require_amount_not_above_duplicate !== false && decimalUnits(payout.amount) > decimalUnits(duplicateAmount)) {
     return decision("needs_human", "amount_above_verified_duplicate", {
       ...base,
       order_ref: orderRef,
