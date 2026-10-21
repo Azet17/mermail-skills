@@ -1,7 +1,9 @@
 // Actual offline evaluator/CLI regressions; no provider or payment effects.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, mkdtemp } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { evaluateClaim } from './refund-policy.mjs';
@@ -48,8 +50,9 @@ test('malformed run state never silently resets eligibility counters', () => {
   for (const run of [null, [], {paidThisRun:-1}, {paidThisRun:1.5}, {alreadyHandled:'1042'}])
     assert.equal(evaluateClaim(claim,ledger,policy,run).reason_code,'invalid_input');
 });
-test('actual CLI holds duplicate charge evidence and rejects malformed caps', async () => {
-  const dir=await mkdtemp('/private/tmp/refund-regression-');
+test('actual CLI holds duplicate charge evidence and rejects malformed caps', async (t) => {
+  const dir=await mkdtemp(join(tmpdir(),'refund-regression-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
   const [l,p]=fresh(); l.orders[0].charges[1].charge_id=l.orders[0].charges[0].charge_id;
   const paths=['claim','ledger','policy'].map(n=>`${dir}/${n}.json`);
   await Promise.all([claim,l,p].map((v,i)=>writeFile(paths[i],JSON.stringify(v))));
